@@ -1,0 +1,1516 @@
+{
+  "name": "n8n-email-verification-cascading-waterfall-engine",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "email-waterfall/verify",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "393cde42-805a-505f-95ce-8a0f480ef6a4",
+      "name": "Verify Emails Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        200
+      ],
+      "webhookId": "00000000-0000-4000-8000-000000000161",
+      "notes": "Signed batch of up to MAX_EMAILS_PER_REQUEST emails · answered by Respond to Webhook. Pinned fictional batch."
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      },
+      "id": "623e8199-a0b3-5a2b-9d42-ddbfbbaf2e4c",
+      "name": "Queue Batch Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        480
+      ],
+      "notes": "Every 15 min: claims pending rows from email_verification_queue. Pinned fictional batch."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Verify & Unwrap Request                Mode: Run Once for All Items\n// Repo: n8n-email-verification-cascading-waterfall-engine · dhRobin Systems\n// Body: { \"emails\": [\"a@x.example\", { \"email\": \"b@y.example\", \"ref\": \"crm-42\" }], \"list_id\": \"…\" }\n// Signed: X-Timestamp (unix seconds) and\n//   X-Signature: sha256=<hex HMAC-SHA256(VERIFY_WEBHOOK_SECRET, timestamp + \".\" + raw body)>\n// Emits one item per email, or one \"rejected\" item (answered with 4xx).\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst helpers = this.helpers;\nlet crypto = null;\ntry { crypto = require('crypto'); } catch (error) { crypto = null; }\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\nconst SECRET = env('VERIFY_WEBHOOK_SECRET', '') || (SANDBOX_MODE ? 'sandbox-fictional-verify-signing-secret' : '');\nconst TOLERANCE = Math.max(60, num('SIGNATURE_TOLERANCE_SECONDS', 300));\nconst MAX = Math.min(5000, Math.max(1, num('MAX_EMAILS_PER_REQUEST', 500)));\nlet runId; try { runId = 'ev_' + crypto.randomUUID(); } catch (e) { runId = 'ev_' + Date.now().toString(36); }\nconst run = { runId, startedAt: new Date().toISOString(), mode: SANDBOX_MODE ? 'sandbox' : DRY_RUN ? 'dry_run' : 'live', sandboxMode: SANDBOX_MODE, dryRun: DRY_RUN, origin: 'webhook' };\nconst items = $input.all();\nconst fx = SANDBOX_MODE ? ((items.find((i) => i.json.sandboxFixtures) || { json: {} }).json.sandboxFixtures || null) : null;\nconst sha = (s) => crypto.createHash('sha256').update(String(s)).digest();\nconst safeEqual = (a, b) => !!crypto && typeof a === 'string' && typeof b === 'string' && a.length > 0 && b.length > 0 && crypto.timingSafeEqual(sha(a), sha(b));\nconst item = items[0];\nconst reject = (reason, httpCode) => [{ json: { run, sandboxFixtures: fx, kind: 'rejected', reason, httpCode } }];\nif (!item) return reject('empty_request', 400);\nif (!crypto) return reject('crypto_module_unavailable', 500);\nif (!SECRET) return reject('webhook_secret_not_configured', 500);\nconst h = {};\nfor (const [k, v] of Object.entries(item.json.headers || {})) h[String(k).toLowerCase()] = Array.isArray(v) ? String(v[0]) : String(v);\nlet raw = null;\nif (item.binary && item.binary.data) { try { raw = (await helpers.getBinaryDataBuffer(0, 'data')).toString('utf8'); } catch (e) { raw = null; } }\nlet body = item.json.body;\nif ((!body || (typeof body === 'object' && !Object.keys(body).length)) && raw) { try { body = JSON.parse(raw); } catch (e) { body = null; } }\nif (raw === null) raw = typeof body === 'string' ? body : JSON.stringify(body ?? {});\nif (typeof body === 'string') { try { body = JSON.parse(body); } catch (e) { body = null; } }\nconst sigHeader = String(h['x-signature'] || '').trim(); const ts = String(h['x-timestamp'] || '').trim();\nif (!sigHeader || !ts) return reject('signature_header_missing', 401);\nconst sig = sigHeader.toLowerCase().startsWith('sha256=') ? sigHeader.slice(7) : sigHeader;\nif (!safeEqual(sig.toLowerCase(), crypto.createHmac('sha256', SECRET).update(`${ts}.${raw}`, 'utf8').digest('hex'))) return reject('signature_mismatch', 401);\nif (!SANDBOX_MODE && (!Number.isFinite(Number(ts)) || Math.abs(Date.now() / 1000 - Number(ts)) > TOLERANCE)) return reject('timestamp_outside_tolerance', 401);\nconst list = Array.isArray((body || {}).emails) ? body.emails : [];\nif (!list.length) return reject('no_emails', 400);\nif (list.length > MAX) return reject('too_many_emails', 413);\nreturn list.map((e, i) => ({ json: { run, sandboxFixtures: fx, kind: 'email', origin: 'webhook', position: i, input: typeof e === 'string' ? e : String((e || {}).email || ''),\n  ref: typeof e === 'object' && e ? String(e.ref || e.external_ref || '') || null : null, listId: body.list_id ? String(body.list_id) : null, queueId: null } }));\n"
+      },
+      "id": "a7870fc4-bff9-5dcb-b5ff-7242e00c14a9",
+      "name": "Verify & Unwrap Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        200
+      ],
+      "notes": "HMAC-SHA256(timestamp.body) · size limit · one item per email."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "e7369f63-6e49-5c9a-8883-c843df6cf9c3",
+              "leftValue": "={{ $env.SANDBOX_MODE !== 'false' && $env.SANDBOX_MODE !== '0' && $env.SANDBOX_MODE !== 'no' && $env.SANDBOX_MODE !== 'off' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "4b6dbe7f-88ce-543f-873c-edd767d9917e",
+      "name": "Sandbox Queue?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        240,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Load Queue Fixtures (Sandbox)          Mode: Run Once for All Items\n// Stand-in for \"Claim Queue Batch\" (same row shape).\n// ─────────────────────────────────────────────────────────────────────\nconst fx = $input.first().json.sandboxFixtures || {};\nreturn (fx.queue || []).map((r) => ({ json: { ...r, sandboxFixtures: fx } }));\n"
+      },
+      "id": "aecb708f-7395-5b11-b384-e75eb3193444",
+      "name": "Load Queue Fixtures (Sandbox)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE email_verification_queue q\n   SET status = 'processing', claimed_at = now(), attempts = q.attempts + 1\n WHERE q.id IN (\n       SELECT id FROM email_verification_queue\n        WHERE status = 'pending' OR (status = 'processing' AND claimed_at < now() - interval '30 minutes')\n        ORDER BY created_at\n        LIMIT $1::int\n        FOR UPDATE SKIP LOCKED)\nRETURNING q.id, q.email, q.list_id, q.external_ref;",
+        "options": {
+          "queryReplacement": "={{ $env.QUEUE_BATCH_SIZE || 200 }}"
+        }
+      },
+      "id": "9dd7db05-98d8-5393-87a1-9774f07f3219",
+      "name": "Claim Queue Batch",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        480,
+        560
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "YOUR_POSTGRES_CREDENTIAL_ID",
+          "name": "Postgres · email verification (YOUR_POSTGRES_URL)"
+        }
+      },
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "notes": "FOR UPDATE SKIP LOCKED · stale claims (30 min) are reclaimed."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Package Queue Batch                    Mode: Run Once for All Items\n// Claimed queue rows → one item per email (same shape as the webhook path).\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\nconst rows = $input.all().map((i) => i.json).filter((r) => r && r.email);\nconst fx = SANDBOX_MODE ? ((rows.find((r) => r.sandboxFixtures) || {}).sandboxFixtures || null) : null;\nlet runId; try { runId = 'ev_' + require('crypto').randomUUID(); } catch (e) { runId = 'ev_' + Date.now().toString(36); }\nconst run = { runId, startedAt: new Date().toISOString(), mode: SANDBOX_MODE ? 'sandbox' : DRY_RUN ? 'dry_run' : 'live', sandboxMode: SANDBOX_MODE, dryRun: DRY_RUN, origin: 'queue' };\nif (!rows.length) return [{ json: { run, sandboxFixtures: fx, kind: 'queue_empty', reason: 'no_pending_rows' } }];\nreturn rows.map((r, i) => ({ json: { run, sandboxFixtures: fx, kind: 'email', origin: 'queue', position: i, input: String(r.email), ref: r.external_ref || null, listId: r.list_id || null, queueId: r.id ?? null } }));\n"
+      },
+      "id": "48f82078-24e0-5e58-a4c3-5c2567dc88b0",
+      "name": "Package Queue Batch",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Syntax & Disposable Pre-filter         Mode: Run Once for All Items\n// Free checks before any paid API call:\n//   syntax (RFC-practical rules, length limits) → invalid / syntax\n//   disposable domains (built-in list + DISPOSABLE_DOMAINS) → disposable\n//   optional MX lookup (MX_CHECK_ENABLED, needs the \"dns\" builtin) →\n//     domains with no MX/A answer → invalid / no_mx\n//   duplicates in the batch → resolved once, copied to the duplicates\n//   role addresses (info@, sales@ …) and common domain typos are flagged.\n// Every email gets a peppered SHA-256 hash used for cache, suppression\n// and audit; the plaintext address is only kept in memory for the calls.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n// Shared helpers: normalisation, hashing and run flags\nconst crypto = require('crypto');\nconst PEPPER = env('EMAIL_HASH_PEPPER', '');\nconst normEmail = (e) => String(e || '').trim().replace(/^mailto:/i, '').toLowerCase();\nconst hashEmail = (e) => crypto.createHash('sha256').update(PEPPER + normEmail(e)).digest('hex');\nconst emailRef = (h) => `em-${String(h).slice(0, 12)}`;\nconst domainOfEmail = (e) => { const i = normEmail(e).lastIndexOf('@'); return i > 0 ? normEmail(e).slice(i + 1) : ''; };\n\nconst items = $input.all();\nconst first = (items[0] || { json: {} }).json;\nconst fx = first.run && first.run.sandboxMode ? ((items.find((i) => i.json.sandboxFixtures) || { json: {} }).json.sandboxFixtures || {}) : {};\nconst cfg = fx.config || {};\nconst listOr = (key, fallback) => { const v = csv(key, '').filter((x) => !/^YOUR_/i.test(x)); return v.length ? v : (fallback || []); };\nconst BUILTIN_DISPOSABLE = ['mailinator.com', 'guerrillamail.com', 'sharklasers.com', '10minutemail.com', 'temp-mail.org', 'tempmail.com', 'yopmail.com', 'trashmail.com', 'getnada.com',\n  'dispostable.com', 'maildrop.cc', 'throwawaymail.com', 'fakeinbox.com', 'mintemail.com', 'emailondeck.com', 'spamgourmet.com', 'mytemp.email', 'tempail.com', 'moakt.com', 'mailnesia.com'];\nconst DISPOSABLE = new Set([...BUILTIN_DISPOSABLE, ...listOr('DISPOSABLE_DOMAINS', cfg.disposableDomains)].map((d) => d.toLowerCase()));\nconst ROLE = new Set(['info', 'admin', 'administrator', 'support', 'sales', 'contact', 'hello', 'office', 'billing', 'accounts', 'noreply', 'no-reply', 'postmaster', 'abuse',\n  'webmaster', 'team', 'marketing', 'hr', 'jobs', 'careers', 'help', 'enquiries', 'inquiries', 'privacy', 'security']);\nconst TYPOS = { 'gmial.com': 'gmail.com', 'gmai.com': 'gmail.com', 'gamil.com': 'gmail.com', 'gnail.com': 'gmail.com', 'gmail.co': 'gmail.com', 'yaho.com': 'yahoo.com', 'yahooo.com': 'yahoo.com',\n  'hotmial.com': 'hotmail.com', 'hotmai.com': 'hotmail.com', 'outlok.com': 'outlook.com', 'outloo.com': 'outlook.com', 'icloud.co': 'icloud.com' };\n// Extra typo pairs: DOMAIN_TYPO_MAP=\"typo.example:right.example,…\" (sandbox fixtures may supply cfg.typoMap)\nfor (const pair of listOr('DOMAIN_TYPO_MAP', Object.entries(cfg.typoMap || {}).map(([a, b]) => `${a}:${b}`))) {\n  const [a, b] = pair.split(':').map((x) => (x || '').trim().toLowerCase()); if (a && b) TYPOS[a] = b;\n}\nconst ROLE_POLICY = env('ROLE_ADDRESS_POLICY', 'verify').toLowerCase(); // verify | risky\nconst MX_CHECK = flag('MX_CHECK_ENABLED', !!cfg.mxCheck);\nconst MX_TIMEOUT = Math.max(500, num('MX_TIMEOUT_MS', 3000));\nconst syntaxOk = (e) => {\n  if (e.length > 254) return false;\n  const at = e.lastIndexOf('@'); if (at < 1) return false;\n  const local = e.slice(0, at); const domain = e.slice(at + 1);\n  if (local.length > 64 || /\\.\\./.test(local) || /^\\.|\\.$/.test(local) || !/^[a-z0-9!#$%&'*+/=?^_`{|}~.-]+$/.test(local)) return false;\n  if (domain.length > 253 || !/^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$/.test(domain)) return false;\n  return true;\n};\n// MX lookups (one per unique domain)\nconst mx = new Map();\nif (MX_CHECK) {\n  const domains = [...new Set(items.filter((i) => i.json.kind === 'email').map((i) => domainOfEmail(i.json.input)).filter(Boolean))];\n  if (first.run && first.run.sandboxMode) for (const d of domains) mx.set(d, !(cfg.noMxDomains || []).includes(d));\n  else {\n    let dns = null; try { dns = require('dns').promises; } catch (e) { dns = null; }\n    if (dns) for (const d of domains) {\n      const withTimeout = (p) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(Object.assign(new Error('timeout'), { code: 'ETIMEOUT' })), MX_TIMEOUT))]);\n      try { const r = await withTimeout(dns.resolveMx(d)); mx.set(d, Array.isArray(r) && r.length > 0); }\n      catch (e) {\n        if (['ENOTFOUND', 'ENODATA'].includes(e.code)) { try { await withTimeout(dns.resolve4(d)); mx.set(d, true); } catch (e2) { mx.set(d, ['ENOTFOUND', 'ENODATA'].includes(e2.code) ? false : null); } }\n        else mx.set(d, null);\n      }\n    }\n  }\n}\nconst out = []; const seen = new Map();\nfor (const item of items) {\n  const j = item.json;\n  if (j.kind !== 'email') { out.push(item); continue; }\n  const email = normEmail(j.input);\n  const hash = hashEmail(email);\n  const domain = domainOfEmail(email);\n  const local = email.split('@')[0] || '';\n  const base = { ...j, email, emailHash: hash, emailRef: emailRef(hash), domain, flags: [], trail: [], decision: null };\n  if (seen.has(hash)) { out.push({ json: { ...base, duplicateOf: seen.get(hash), flags: ['duplicate_in_batch'] } }); continue; }\n  seen.set(hash, j.position);\n  const decide = (status, subStatus, by) => { base.decision = { status, subStatus, decidedBy: by, confidence: 99, definitive: true }; };\n  if (!syntaxOk(email)) decide('invalid', 'syntax', 'prefilter');\n  else if (DISPOSABLE.has(domain)) decide('disposable', 'disposable_domain', 'prefilter');\n  else if (MX_CHECK && mx.get(domain) === false) decide('invalid', 'no_mx', 'prefilter');\n  if (ROLE.has(local.split('+')[0])) { base.flags.push('role_address'); if (!base.decision && ROLE_POLICY === 'risky') decide('risky', 'role_address', 'prefilter'); }\n  if (TYPOS[domain]) { base.flags.push('possible_typo'); base.didYouMean = `${local}@${TYPOS[domain]}`; }\n  out.push({ json: base });\n}\nreturn out;\n"
+      },
+      "id": "b33c2cbc-d5e4-5568-9f0d-74d615993818",
+      "name": "Syntax & Disposable Pre-filter",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        300
+      ],
+      "notes": "Syntax · disposable domains · optional MX · duplicates · role & typo flags · hashing."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Build Cache Query                      Mode: Run Once for All Items\n// One item with the hashes still undecided, base64-encoded so the Postgres\n// node's comma-separated query parameters can't split them.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst items = $input.all().map((i) => i.json);\nconst hashes = [...new Set(items.filter((j) => j.kind === 'email' && !j.decision && j.duplicateOf === undefined).map((j) => j.emailHash))];\nconst days = Math.max(1, Math.max(num('CACHE_TTL_DAYS', 30), num('RISKY_CACHE_TTL_DAYS', 7)));\nconst first = items[0] || {};\nreturn [{ json: { run: first.run, sandboxFixtures: first.sandboxFixtures || null, hashCount: hashes.length, p1: Buffer.from(JSON.stringify(hashes)).toString('base64'), p2: String(days) } }];\n"
+      },
+      "id": "566469ec-4bcf-5c00-9e51-0b5afdb9cfb8",
+      "name": "Build Cache Query",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "6ce790f7-c708-5ac2-b98b-513a6c44f87f",
+              "leftValue": "={{ $json.run.sandboxMode }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "36df272a-dc3e-5446-b802-3fa259a472b9",
+      "name": "Sandbox DB Read?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1440,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Simulate Cache Lookup (Sandbox)        Mode: Run Once for All Items\n// Stand-in for \"Lookup Cache & Suppression\" (same row shape).\n// ─────────────────────────────────────────────────────────────────────\nconst fx = $input.first().json.sandboxFixtures || {};\nconst wanted = new Set(JSON.parse(Buffer.from($input.first().json.p1, 'base64').toString('utf8')));\nconst rows = (fx.dbRows || []).filter((r) => wanted.has(r.email_hash));\nreturn rows.length ? rows.map((r) => ({ json: r })) : [{ json: {} }];\n"
+      },
+      "id": "639d5780-2210-5925-acac-7ff4f4f8ef03",
+      "name": "Simulate Cache Lookup (Sandbox)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT h.email_hash, r.final_status, r.sub_status, r.confidence, r.decided_by, r.verified_at, s.reason AS suppressed_reason\n  FROM json_array_elements_text(convert_from(decode($1, 'base64'), 'UTF8')::json) AS h(email_hash)\n  LEFT JOIN LATERAL (\n       SELECT final_status, sub_status, confidence, decided_by, verified_at\n         FROM email_verification_results r\n        WHERE r.email_hash = h.email_hash\n          AND r.verified_at > now() - make_interval(days => $2::int)\n          AND r.final_status <> 'unknown'\n        ORDER BY r.verified_at DESC\n        LIMIT 1) r ON true\n  LEFT JOIN email_suppression s ON s.email_hash = h.email_hash\n WHERE r.final_status IS NOT NULL OR s.reason IS NOT NULL;",
+        "options": {
+          "queryReplacement": "={{ $json.p1 }},{{ $json.p2 }}"
+        }
+      },
+      "id": "1521d160-56cb-59f6-9134-60637e9f80af",
+      "name": "Lookup Cache & Suppression",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1680,
+        380
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "YOUR_POSTGRES_CREDENTIAL_ID",
+          "name": "Postgres · email verification (YOUR_POSTGRES_URL)"
+        }
+      },
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "Recent verdicts (TTL) + suppression list, by hash."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Apply Cache & Suppression              Mode: Run Once for All Items\n// Before any paid call:\n//   on the suppression list → \"suppressed\" (no API call)\n//   verified within CACHE_TTL_DAYS (valid / invalid / disposable /\n//   do_not_mail) or RISKY_CACHE_TTL_DAYS (risky) → reuse the stored verdict.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst items = $('Syntax & Disposable Pre-filter').all().map((i) => i.json);\nconst rows = $input.all().map((i) => i.json).filter((r) => r && r.email_hash);\nconst TTL = Math.max(1, num('CACHE_TTL_DAYS', 30)); const RISKY_TTL = Math.max(1, num('RISKY_CACHE_TTL_DAYS', 7));\nconst fx = (items[0] || {}).sandboxFixtures || {};\nconst now = fx.now ? new Date(fx.now) : new Date();\nconst byHash = new Map(rows.map((r) => [r.email_hash, r]));\nreturn items.map((j) => {\n  if (j.kind !== 'email' || j.decision || j.duplicateOf !== undefined) return { json: j };\n  const r = byHash.get(j.emailHash);\n  if (!r) return { json: j };\n  if (r.suppressed_reason) return { json: { ...j, decision: { status: 'suppressed', subStatus: r.suppressed_reason, decidedBy: 'suppression_list', confidence: 100, definitive: true } } };\n  const age = (now.getTime() - Date.parse(r.verified_at)) / 86400000;\n  const ttl = r.final_status === 'risky' ? RISKY_TTL : TTL;\n  if (r.final_status && r.final_status !== 'unknown' && age <= ttl) {\n    return { json: { ...j, decision: { status: r.final_status, subStatus: r.sub_status || null, decidedBy: `cache:${r.decided_by || 'unknown'}`, confidence: Number(r.confidence) || 80, definitive: true, cachedAt: r.verified_at } } };\n  }\n  return { json: j };\n});\n"
+      },
+      "id": "f87048f2-b9f5-5ea1-b9fc-97124ace42e3",
+      "name": "Apply Cache & Suppression",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1920,
+        300
+      ],
+      "notes": "Suppressed and recently verified emails skip every paid call."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Waterfall Stage · ZeroBounce                  Mode: Run Once for All Items\n// Calls ZeroBounce only for emails no earlier step decided. See _stage logic below.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst PROVIDER = 'zerobounce';\n// Waterfall stage: calls PROVIDER only for emails still undecided, stops\n// early on definitive results, and respects per-run caps, daily credit\n// budgets and a circuit breaker. Every item passes through unchanged\n// otherwise, so the chain stays linear.\nconst helpers = this.helpers;\nconst UP = PROVIDER.toUpperCase();\nconst items = $input.all().map((i) => i.json);\nconst first = items[0] || {};\nconst SANDBOX = first.run ? !!first.run.sandboxMode : flag('SANDBOX_MODE', true);\nconst fx = SANDBOX ? (first.sandboxFixtures || {}) : {};\nconst KEY = env(`${UP}_API_KEY`, '');\nconst ENABLED = flag(`${UP}_ENABLED`, true) && (SANDBOX || (!!KEY && !/^YOUR_/i.test(KEY)));\nconst MAX_CALLS = Math.max(0, num(`${UP}_MAX_CALLS_PER_RUN`, 500));\nconst DAILY = Math.max(0, num(`${UP}_DAILY_CREDIT_BUDGET`, 0));\nconst TIMEOUT = Math.max(2, num(`${UP}_TIMEOUT_SECONDS`, PROVIDER === 'neverbounce' ? 20 : 15));\nconst CONCURRENCY = Math.min(10, Math.max(1, num('PROVIDER_CONCURRENCY', 3)));\nconst BREAK_AFTER = Math.max(1, num('CIRCUIT_BREAK_AFTER_ERRORS', 3));\nconst EARLY = new Set(csv('EARLY_EXIT_STATUSES', 'valid,invalid,disposable,do_not_mail,risky'));\nconst sd = SANDBOX ? {} : $getWorkflowStaticData('global');\nconst today = new Date().toISOString().slice(0, 10);\nconst budget = SANDBOX ? { day: today, used: 0 } : ((sd.verifyBudget = sd.verifyBudget || {})[PROVIDER] = ((sd.verifyBudget || {})[PROVIDER] && sd.verifyBudget[PROVIDER].day === today) ? sd.verifyBudget[PROVIDER] : { day: today, used: 0 });\n\n// Provider adapters → { status, subStatus, definitive, confidence, credit, error, flags }\nconst ADAPTERS = {\n  zerobounce: {\n    request: (email) => ({ method: 'GET', url: `${env('ZEROBOUNCE_API_BASE_URL', 'https://api.zerobounce.net').replace(/\\/+$/, '')}/v2/validate`, qs: { api_key: KEY, email, ip_address: '' } }),\n    parse: (b) => {\n      if (!b || b.error) return { status: 'error', subStatus: /credit/i.test(String(b && b.error)) ? 'out_of_credits' : /api key/i.test(String(b && b.error)) ? 'auth_failed' : 'provider_error', fatal: /credit|api key/i.test(String(b && b.error)) };\n      const s = String(b.status || '').toLowerCase(); const sub = String(b.sub_status || '').toLowerCase() || null;\n      const flags = { free: !!b.free_email, didYouMean: b.did_you_mean || null };\n      if (s === 'valid') return { status: 'valid', subStatus: sub, confidence: 95, credit: 1, flags };\n      if (s === 'invalid') return { status: 'invalid', subStatus: sub, confidence: 95, credit: 1, flags };\n      if (s === 'spamtrap' || s === 'abuse') return { status: 'do_not_mail', subStatus: s, confidence: 95, credit: 1, flags };\n      if (s === 'do_not_mail') {\n        if (sub === 'disposable') return { status: 'disposable', subStatus: sub, confidence: 95, credit: 1, flags };\n        if (sub === 'role_based' || sub === 'role_based_catch_all') return { status: 'risky', subStatus: sub, confidence: 85, credit: 1, flags };\n        return { status: 'do_not_mail', subStatus: sub, confidence: 90, credit: 1, flags };\n      }\n      if (s === 'catch-all' || s === 'catch_all') return { status: 'catch_all', subStatus: sub, confidence: 50, credit: 1, flags };\n      return { status: 'unknown', subStatus: sub, confidence: 0, credit: 0, flags };\n    },\n  },\n  neverbounce: {\n    request: (email) => ({ method: 'GET', url: `${env('NEVERBOUNCE_API_BASE_URL', 'https://api.neverbounce.com').replace(/\\/+$/, '')}/v4/single/check`, qs: { key: KEY, email, timeout: String(Math.max(2, TIMEOUT - 3)) } }),\n    parse: (b) => {\n      if (!b || b.status !== 'success') { const st = String((b && b.status) || 'provider_error'); return { status: 'error', subStatus: st, fatal: ['auth_failure', 'bad_referrer'].includes(st) || /credit/i.test(String(b && b.message)) }; }\n      const r = String(b.result || '').toLowerCase(); const flags = { didYouMean: b.suggested_correction || null, nbFlags: (b.flags || []).slice(0, 10) };\n      if (r === 'valid') return { status: 'valid', subStatus: null, confidence: 92, credit: 1, flags };\n      if (r === 'invalid') return { status: 'invalid', subStatus: null, confidence: 92, credit: 1, flags };\n      if (r === 'disposable') return { status: 'disposable', subStatus: null, confidence: 92, credit: 1, flags };\n      if (r === 'catchall') return { status: 'catch_all', subStatus: null, confidence: 50, credit: 1, flags };\n      return { status: 'unknown', subStatus: null, confidence: 0, credit: 0, flags };\n    },\n  },\n  millionverifier: {\n    request: (email) => ({ method: 'GET', url: `${env('MILLIONVERIFIER_API_BASE_URL', 'https://api.millionverifier.com').replace(/\\/+$/, '')}/api/v3/`, qs: { api: KEY, email, timeout: String(Math.min(60, Math.max(2, TIMEOUT - 3))) } }),\n    parse: (b) => {\n      if (!b || (b.error && String(b.error).trim())) return { status: 'error', subStatus: /credit/i.test(String(b && b.error)) ? 'out_of_credits' : /api/i.test(String(b && b.error)) ? 'auth_failed' : 'provider_error', fatal: /credit|api/i.test(String(b && b.error)) };\n      const r = String(b.result || '').toLowerCase(); const flags = { free: !!b.free, role: !!b.role, didYouMean: b.didyoumean || null, quality: b.quality || null };\n      if (r === 'ok') return { status: 'valid', subStatus: b.subresult || null, confidence: 90, credit: 1, flags };\n      if (r === 'invalid') return { status: 'invalid', subStatus: b.subresult || null, confidence: 90, credit: 1, flags };\n      if (r === 'disposable') return { status: 'disposable', subStatus: b.subresult || null, confidence: 90, credit: 1, flags };\n      if (r === 'catch_all') return { status: 'catch_all', subStatus: b.subresult || null, confidence: 50, credit: 0, flags };\n      if (r === 'error') return { status: 'error', subStatus: b.subresult || 'provider_error', fatal: false };\n      return { status: 'unknown', subStatus: b.subresult || null, confidence: 0, credit: 0, flags };\n    },\n  },\n};\nconst A = ADAPTERS[PROVIDER];\nconst callOnce = async (email) => {\n  if (SANDBOX) {\n    const f = (((fx.providers || {})[PROVIDER]) || {})[email];\n    if (f && f.__http) return { http: f.__http, body: f.body || {} };\n    return { http: 200, body: f || (PROVIDER === 'neverbounce' ? { status: 'success', result: 'unknown' } : PROVIDER === 'millionverifier' ? { result: 'unknown', error: '' } : { status: 'unknown' }) };\n  }\n  if (!helpers || typeof helpers.httpRequest !== 'function') return { http: 0, body: null, unavailable: true };\n  try {\n    const res = await helpers.httpRequest({ ...A.request(email), json: true, timeout: TIMEOUT * 1000, returnFullResponse: true, ignoreHttpStatusErrors: true });\n    return { http: Number(res.statusCode) || 0, body: res.body };\n  } catch (e) { return { http: 0, body: null, networkError: String((e && e.code) || 'request_failed') }; }\n};\nconst stats = { provider: PROVIDER, enabled: ENABLED, calls: 0, credits: 0, decided: 0, errors: 0, skipped: 0, circuitOpen: false, reason: null };\nlet consecutive = 0;\nconst pending = items.filter((j) => j.kind === 'email' && !j.decision && j.duplicateOf === undefined);\nif (!ENABLED) { stats.reason = SANDBOX ? 'disabled' : 'not_configured'; stats.skipped = pending.length; }\nfor (let i = 0; ENABLED && i < pending.length; i += CONCURRENCY) {\n  const chunk = [];\n  for (const j of pending.slice(i, i + CONCURRENCY)) {\n    if (stats.circuitOpen) { j.trail.push({ provider: PROVIDER, status: 'skipped', subStatus: 'circuit_open' }); stats.skipped++; continue; }\n    if (stats.calls >= MAX_CALLS) { j.trail.push({ provider: PROVIDER, status: 'skipped', subStatus: 'run_cap_reached' }); stats.skipped++; stats.reason = 'run_cap_reached'; continue; }\n    if (DAILY && budget.used >= DAILY) { j.trail.push({ provider: PROVIDER, status: 'skipped', subStatus: 'daily_budget_reached' }); stats.skipped++; stats.reason = 'daily_budget_reached'; continue; }\n    stats.calls++; budget.used++;\n    chunk.push((async () => {\n      const t0 = Date.now();\n      const res = await callOnce(j.email);\n      let parsed;\n      if (res.unavailable) parsed = { status: 'error', subStatus: 'http_helper_unavailable', fatal: true };\n      else if (res.http === 401 || res.http === 403) parsed = { status: 'error', subStatus: 'auth_failed', fatal: true };\n      else if (res.http === 402) parsed = { status: 'error', subStatus: 'out_of_credits', fatal: true };\n      else if (res.http === 429) parsed = { status: 'error', subStatus: 'rate_limited', fatal: false };\n      else if (!res.http || res.http >= 500) parsed = { status: 'error', subStatus: res.networkError || `http_${res.http || 0}`, fatal: false };\n      else parsed = A.parse(res.body);\n      const entry = { provider: PROVIDER, status: parsed.status, subStatus: parsed.subStatus || null, confidence: parsed.confidence || 0, credit: parsed.credit || 0, ms: Date.now() - t0 };\n      j.trail.push(entry);\n      if (parsed.flags) { if (parsed.flags.didYouMean && !j.didYouMean) j.didYouMean = String(parsed.flags.didYouMean).toLowerCase(); if (parsed.flags.role && !j.flags.includes('role_address')) j.flags.push('role_address'); if (parsed.flags.free && !j.flags.includes('free_mailbox')) j.flags.push('free_mailbox'); }\n      stats.credits += entry.credit;\n      if (parsed.status === 'error') {\n        stats.errors++; consecutive++;\n        if (parsed.fatal || consecutive >= BREAK_AFTER) { stats.circuitOpen = true; stats.reason = parsed.subStatus; }\n        if (budget.used > 0) budget.used--; // failed calls don't consume budget\n        return;\n      }\n      consecutive = 0;\n      if (EARLY.has(parsed.status)) { j.decision = { status: parsed.status, subStatus: parsed.subStatus || null, decidedBy: PROVIDER, confidence: parsed.confidence, definitive: true }; stats.decided++; }\n    })());\n  }\n  await Promise.all(chunk);\n}\nconst prevStats = (first.waterfallStats || []);\nreturn items.map((j) => ({ json: { ...j, waterfallStats: [...prevStats.filter((s) => s.provider !== PROVIDER), stats] } }));\n"
+      },
+      "id": "137bf19d-82cf-541f-bfbc-1f7104aa33e7",
+      "name": "Waterfall Stage · ZeroBounce",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2160,
+        300
+      ],
+      "notes": "GET /v2/validate · early exit on valid / invalid / disposable / do_not_mail / role."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Waterfall Stage · NeverBounce                  Mode: Run Once for All Items\n// Calls NeverBounce only for emails no earlier step decided. See _stage logic below.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst PROVIDER = 'neverbounce';\n// Waterfall stage: calls PROVIDER only for emails still undecided, stops\n// early on definitive results, and respects per-run caps, daily credit\n// budgets and a circuit breaker. Every item passes through unchanged\n// otherwise, so the chain stays linear.\nconst helpers = this.helpers;\nconst UP = PROVIDER.toUpperCase();\nconst items = $input.all().map((i) => i.json);\nconst first = items[0] || {};\nconst SANDBOX = first.run ? !!first.run.sandboxMode : flag('SANDBOX_MODE', true);\nconst fx = SANDBOX ? (first.sandboxFixtures || {}) : {};\nconst KEY = env(`${UP}_API_KEY`, '');\nconst ENABLED = flag(`${UP}_ENABLED`, true) && (SANDBOX || (!!KEY && !/^YOUR_/i.test(KEY)));\nconst MAX_CALLS = Math.max(0, num(`${UP}_MAX_CALLS_PER_RUN`, 500));\nconst DAILY = Math.max(0, num(`${UP}_DAILY_CREDIT_BUDGET`, 0));\nconst TIMEOUT = Math.max(2, num(`${UP}_TIMEOUT_SECONDS`, PROVIDER === 'neverbounce' ? 20 : 15));\nconst CONCURRENCY = Math.min(10, Math.max(1, num('PROVIDER_CONCURRENCY', 3)));\nconst BREAK_AFTER = Math.max(1, num('CIRCUIT_BREAK_AFTER_ERRORS', 3));\nconst EARLY = new Set(csv('EARLY_EXIT_STATUSES', 'valid,invalid,disposable,do_not_mail,risky'));\nconst sd = SANDBOX ? {} : $getWorkflowStaticData('global');\nconst today = new Date().toISOString().slice(0, 10);\nconst budget = SANDBOX ? { day: today, used: 0 } : ((sd.verifyBudget = sd.verifyBudget || {})[PROVIDER] = ((sd.verifyBudget || {})[PROVIDER] && sd.verifyBudget[PROVIDER].day === today) ? sd.verifyBudget[PROVIDER] : { day: today, used: 0 });\n\n// Provider adapters → { status, subStatus, definitive, confidence, credit, error, flags }\nconst ADAPTERS = {\n  zerobounce: {\n    request: (email) => ({ method: 'GET', url: `${env('ZEROBOUNCE_API_BASE_URL', 'https://api.zerobounce.net').replace(/\\/+$/, '')}/v2/validate`, qs: { api_key: KEY, email, ip_address: '' } }),\n    parse: (b) => {\n      if (!b || b.error) return { status: 'error', subStatus: /credit/i.test(String(b && b.error)) ? 'out_of_credits' : /api key/i.test(String(b && b.error)) ? 'auth_failed' : 'provider_error', fatal: /credit|api key/i.test(String(b && b.error)) };\n      const s = String(b.status || '').toLowerCase(); const sub = String(b.sub_status || '').toLowerCase() || null;\n      const flags = { free: !!b.free_email, didYouMean: b.did_you_mean || null };\n      if (s === 'valid') return { status: 'valid', subStatus: sub, confidence: 95, credit: 1, flags };\n      if (s === 'invalid') return { status: 'invalid', subStatus: sub, confidence: 95, credit: 1, flags };\n      if (s === 'spamtrap' || s === 'abuse') return { status: 'do_not_mail', subStatus: s, confidence: 95, credit: 1, flags };\n      if (s === 'do_not_mail') {\n        if (sub === 'disposable') return { status: 'disposable', subStatus: sub, confidence: 95, credit: 1, flags };\n        if (sub === 'role_based' || sub === 'role_based_catch_all') return { status: 'risky', subStatus: sub, confidence: 85, credit: 1, flags };\n        return { status: 'do_not_mail', subStatus: sub, confidence: 90, credit: 1, flags };\n      }\n      if (s === 'catch-all' || s === 'catch_all') return { status: 'catch_all', subStatus: sub, confidence: 50, credit: 1, flags };\n      return { status: 'unknown', subStatus: sub, confidence: 0, credit: 0, flags };\n    },\n  },\n  neverbounce: {\n    request: (email) => ({ method: 'GET', url: `${env('NEVERBOUNCE_API_BASE_URL', 'https://api.neverbounce.com').replace(/\\/+$/, '')}/v4/single/check`, qs: { key: KEY, email, timeout: String(Math.max(2, TIMEOUT - 3)) } }),\n    parse: (b) => {\n      if (!b || b.status !== 'success') { const st = String((b && b.status) || 'provider_error'); return { status: 'error', subStatus: st, fatal: ['auth_failure', 'bad_referrer'].includes(st) || /credit/i.test(String(b && b.message)) }; }\n      const r = String(b.result || '').toLowerCase(); const flags = { didYouMean: b.suggested_correction || null, nbFlags: (b.flags || []).slice(0, 10) };\n      if (r === 'valid') return { status: 'valid', subStatus: null, confidence: 92, credit: 1, flags };\n      if (r === 'invalid') return { status: 'invalid', subStatus: null, confidence: 92, credit: 1, flags };\n      if (r === 'disposable') return { status: 'disposable', subStatus: null, confidence: 92, credit: 1, flags };\n      if (r === 'catchall') return { status: 'catch_all', subStatus: null, confidence: 50, credit: 1, flags };\n      return { status: 'unknown', subStatus: null, confidence: 0, credit: 0, flags };\n    },\n  },\n  millionverifier: {\n    request: (email) => ({ method: 'GET', url: `${env('MILLIONVERIFIER_API_BASE_URL', 'https://api.millionverifier.com').replace(/\\/+$/, '')}/api/v3/`, qs: { api: KEY, email, timeout: String(Math.min(60, Math.max(2, TIMEOUT - 3))) } }),\n    parse: (b) => {\n      if (!b || (b.error && String(b.error).trim())) return { status: 'error', subStatus: /credit/i.test(String(b && b.error)) ? 'out_of_credits' : /api/i.test(String(b && b.error)) ? 'auth_failed' : 'provider_error', fatal: /credit|api/i.test(String(b && b.error)) };\n      const r = String(b.result || '').toLowerCase(); const flags = { free: !!b.free, role: !!b.role, didYouMean: b.didyoumean || null, quality: b.quality || null };\n      if (r === 'ok') return { status: 'valid', subStatus: b.subresult || null, confidence: 90, credit: 1, flags };\n      if (r === 'invalid') return { status: 'invalid', subStatus: b.subresult || null, confidence: 90, credit: 1, flags };\n      if (r === 'disposable') return { status: 'disposable', subStatus: b.subresult || null, confidence: 90, credit: 1, flags };\n      if (r === 'catch_all') return { status: 'catch_all', subStatus: b.subresult || null, confidence: 50, credit: 0, flags };\n      if (r === 'error') return { status: 'error', subStatus: b.subresult || 'provider_error', fatal: false };\n      return { status: 'unknown', subStatus: b.subresult || null, confidence: 0, credit: 0, flags };\n    },\n  },\n};\nconst A = ADAPTERS[PROVIDER];\nconst callOnce = async (email) => {\n  if (SANDBOX) {\n    const f = (((fx.providers || {})[PROVIDER]) || {})[email];\n    if (f && f.__http) return { http: f.__http, body: f.body || {} };\n    return { http: 200, body: f || (PROVIDER === 'neverbounce' ? { status: 'success', result: 'unknown' } : PROVIDER === 'millionverifier' ? { result: 'unknown', error: '' } : { status: 'unknown' }) };\n  }\n  if (!helpers || typeof helpers.httpRequest !== 'function') return { http: 0, body: null, unavailable: true };\n  try {\n    const res = await helpers.httpRequest({ ...A.request(email), json: true, timeout: TIMEOUT * 1000, returnFullResponse: true, ignoreHttpStatusErrors: true });\n    return { http: Number(res.statusCode) || 0, body: res.body };\n  } catch (e) { return { http: 0, body: null, networkError: String((e && e.code) || 'request_failed') }; }\n};\nconst stats = { provider: PROVIDER, enabled: ENABLED, calls: 0, credits: 0, decided: 0, errors: 0, skipped: 0, circuitOpen: false, reason: null };\nlet consecutive = 0;\nconst pending = items.filter((j) => j.kind === 'email' && !j.decision && j.duplicateOf === undefined);\nif (!ENABLED) { stats.reason = SANDBOX ? 'disabled' : 'not_configured'; stats.skipped = pending.length; }\nfor (let i = 0; ENABLED && i < pending.length; i += CONCURRENCY) {\n  const chunk = [];\n  for (const j of pending.slice(i, i + CONCURRENCY)) {\n    if (stats.circuitOpen) { j.trail.push({ provider: PROVIDER, status: 'skipped', subStatus: 'circuit_open' }); stats.skipped++; continue; }\n    if (stats.calls >= MAX_CALLS) { j.trail.push({ provider: PROVIDER, status: 'skipped', subStatus: 'run_cap_reached' }); stats.skipped++; stats.reason = 'run_cap_reached'; continue; }\n    if (DAILY && budget.used >= DAILY) { j.trail.push({ provider: PROVIDER, status: 'skipped', subStatus: 'daily_budget_reached' }); stats.skipped++; stats.reason = 'daily_budget_reached'; continue; }\n    stats.calls++; budget.used++;\n    chunk.push((async () => {\n      const t0 = Date.now();\n      const res = await callOnce(j.email);\n      let parsed;\n      if (res.unavailable) parsed = { status: 'error', subStatus: 'http_helper_unavailable', fatal: true };\n      else if (res.http === 401 || res.http === 403) parsed = { status: 'error', subStatus: 'auth_failed', fatal: true };\n      else if (res.http === 402) parsed = { status: 'error', subStatus: 'out_of_credits', fatal: true };\n      else if (res.http === 429) parsed = { status: 'error', subStatus: 'rate_limited', fatal: false };\n      else if (!res.http || res.http >= 500) parsed = { status: 'error', subStatus: res.networkError || `http_${res.http || 0}`, fatal: false };\n      else parsed = A.parse(res.body);\n      const entry = { provider: PROVIDER, status: parsed.status, subStatus: parsed.subStatus || null, confidence: parsed.confidence || 0, credit: parsed.credit || 0, ms: Date.now() - t0 };\n      j.trail.push(entry);\n      if (parsed.flags) { if (parsed.flags.didYouMean && !j.didYouMean) j.didYouMean = String(parsed.flags.didYouMean).toLowerCase(); if (parsed.flags.role && !j.flags.includes('role_address')) j.flags.push('role_address'); if (parsed.flags.free && !j.flags.includes('free_mailbox')) j.flags.push('free_mailbox'); }\n      stats.credits += entry.credit;\n      if (parsed.status === 'error') {\n        stats.errors++; consecutive++;\n        if (parsed.fatal || consecutive >= BREAK_AFTER) { stats.circuitOpen = true; stats.reason = parsed.subStatus; }\n        if (budget.used > 0) budget.used--; // failed calls don't consume budget\n        return;\n      }\n      consecutive = 0;\n      if (EARLY.has(parsed.status)) { j.decision = { status: parsed.status, subStatus: parsed.subStatus || null, decidedBy: PROVIDER, confidence: parsed.confidence, definitive: true }; stats.decided++; }\n    })());\n  }\n  await Promise.all(chunk);\n}\nconst prevStats = (first.waterfallStats || []);\nreturn items.map((j) => ({ json: { ...j, waterfallStats: [...prevStats.filter((s) => s.provider !== PROVIDER), stats] } }));\n"
+      },
+      "id": "386ca58d-0557-5524-88d2-490478e702fa",
+      "name": "Waterfall Stage · NeverBounce",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2400,
+        300
+      ],
+      "notes": "GET /v4/single/check · only emails ZeroBounce left open (catch-all, unknown, errors)."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Waterfall Stage · MillionVerifier                  Mode: Run Once for All Items\n// Calls MillionVerifier only for emails no earlier step decided. See _stage logic below.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst PROVIDER = 'millionverifier';\n// Waterfall stage: calls PROVIDER only for emails still undecided, stops\n// early on definitive results, and respects per-run caps, daily credit\n// budgets and a circuit breaker. Every item passes through unchanged\n// otherwise, so the chain stays linear.\nconst helpers = this.helpers;\nconst UP = PROVIDER.toUpperCase();\nconst items = $input.all().map((i) => i.json);\nconst first = items[0] || {};\nconst SANDBOX = first.run ? !!first.run.sandboxMode : flag('SANDBOX_MODE', true);\nconst fx = SANDBOX ? (first.sandboxFixtures || {}) : {};\nconst KEY = env(`${UP}_API_KEY`, '');\nconst ENABLED = flag(`${UP}_ENABLED`, true) && (SANDBOX || (!!KEY && !/^YOUR_/i.test(KEY)));\nconst MAX_CALLS = Math.max(0, num(`${UP}_MAX_CALLS_PER_RUN`, 500));\nconst DAILY = Math.max(0, num(`${UP}_DAILY_CREDIT_BUDGET`, 0));\nconst TIMEOUT = Math.max(2, num(`${UP}_TIMEOUT_SECONDS`, PROVIDER === 'neverbounce' ? 20 : 15));\nconst CONCURRENCY = Math.min(10, Math.max(1, num('PROVIDER_CONCURRENCY', 3)));\nconst BREAK_AFTER = Math.max(1, num('CIRCUIT_BREAK_AFTER_ERRORS', 3));\nconst EARLY = new Set(csv('EARLY_EXIT_STATUSES', 'valid,invalid,disposable,do_not_mail,risky'));\nconst sd = SANDBOX ? {} : $getWorkflowStaticData('global');\nconst today = new Date().toISOString().slice(0, 10);\nconst budget = SANDBOX ? { day: today, used: 0 } : ((sd.verifyBudget = sd.verifyBudget || {})[PROVIDER] = ((sd.verifyBudget || {})[PROVIDER] && sd.verifyBudget[PROVIDER].day === today) ? sd.verifyBudget[PROVIDER] : { day: today, used: 0 });\n\n// Provider adapters → { status, subStatus, definitive, confidence, credit, error, flags }\nconst ADAPTERS = {\n  zerobounce: {\n    request: (email) => ({ method: 'GET', url: `${env('ZEROBOUNCE_API_BASE_URL', 'https://api.zerobounce.net').replace(/\\/+$/, '')}/v2/validate`, qs: { api_key: KEY, email, ip_address: '' } }),\n    parse: (b) => {\n      if (!b || b.error) return { status: 'error', subStatus: /credit/i.test(String(b && b.error)) ? 'out_of_credits' : /api key/i.test(String(b && b.error)) ? 'auth_failed' : 'provider_error', fatal: /credit|api key/i.test(String(b && b.error)) };\n      const s = String(b.status || '').toLowerCase(); const sub = String(b.sub_status || '').toLowerCase() || null;\n      const flags = { free: !!b.free_email, didYouMean: b.did_you_mean || null };\n      if (s === 'valid') return { status: 'valid', subStatus: sub, confidence: 95, credit: 1, flags };\n      if (s === 'invalid') return { status: 'invalid', subStatus: sub, confidence: 95, credit: 1, flags };\n      if (s === 'spamtrap' || s === 'abuse') return { status: 'do_not_mail', subStatus: s, confidence: 95, credit: 1, flags };\n      if (s === 'do_not_mail') {\n        if (sub === 'disposable') return { status: 'disposable', subStatus: sub, confidence: 95, credit: 1, flags };\n        if (sub === 'role_based' || sub === 'role_based_catch_all') return { status: 'risky', subStatus: sub, confidence: 85, credit: 1, flags };\n        return { status: 'do_not_mail', subStatus: sub, confidence: 90, credit: 1, flags };\n      }\n      if (s === 'catch-all' || s === 'catch_all') return { status: 'catch_all', subStatus: sub, confidence: 50, credit: 1, flags };\n      return { status: 'unknown', subStatus: sub, confidence: 0, credit: 0, flags };\n    },\n  },\n  neverbounce: {\n    request: (email) => ({ method: 'GET', url: `${env('NEVERBOUNCE_API_BASE_URL', 'https://api.neverbounce.com').replace(/\\/+$/, '')}/v4/single/check`, qs: { key: KEY, email, timeout: String(Math.max(2, TIMEOUT - 3)) } }),\n    parse: (b) => {\n      if (!b || b.status !== 'success') { const st = String((b && b.status) || 'provider_error'); return { status: 'error', subStatus: st, fatal: ['auth_failure', 'bad_referrer'].includes(st) || /credit/i.test(String(b && b.message)) }; }\n      const r = String(b.result || '').toLowerCase(); const flags = { didYouMean: b.suggested_correction || null, nbFlags: (b.flags || []).slice(0, 10) };\n      if (r === 'valid') return { status: 'valid', subStatus: null, confidence: 92, credit: 1, flags };\n      if (r === 'invalid') return { status: 'invalid', subStatus: null, confidence: 92, credit: 1, flags };\n      if (r === 'disposable') return { status: 'disposable', subStatus: null, confidence: 92, credit: 1, flags };\n      if (r === 'catchall') return { status: 'catch_all', subStatus: null, confidence: 50, credit: 1, flags };\n      return { status: 'unknown', subStatus: null, confidence: 0, credit: 0, flags };\n    },\n  },\n  millionverifier: {\n    request: (email) => ({ method: 'GET', url: `${env('MILLIONVERIFIER_API_BASE_URL', 'https://api.millionverifier.com').replace(/\\/+$/, '')}/api/v3/`, qs: { api: KEY, email, timeout: String(Math.min(60, Math.max(2, TIMEOUT - 3))) } }),\n    parse: (b) => {\n      if (!b || (b.error && String(b.error).trim())) return { status: 'error', subStatus: /credit/i.test(String(b && b.error)) ? 'out_of_credits' : /api/i.test(String(b && b.error)) ? 'auth_failed' : 'provider_error', fatal: /credit|api/i.test(String(b && b.error)) };\n      const r = String(b.result || '').toLowerCase(); const flags = { free: !!b.free, role: !!b.role, didYouMean: b.didyoumean || null, quality: b.quality || null };\n      if (r === 'ok') return { status: 'valid', subStatus: b.subresult || null, confidence: 90, credit: 1, flags };\n      if (r === 'invalid') return { status: 'invalid', subStatus: b.subresult || null, confidence: 90, credit: 1, flags };\n      if (r === 'disposable') return { status: 'disposable', subStatus: b.subresult || null, confidence: 90, credit: 1, flags };\n      if (r === 'catch_all') return { status: 'catch_all', subStatus: b.subresult || null, confidence: 50, credit: 0, flags };\n      if (r === 'error') return { status: 'error', subStatus: b.subresult || 'provider_error', fatal: false };\n      return { status: 'unknown', subStatus: b.subresult || null, confidence: 0, credit: 0, flags };\n    },\n  },\n};\nconst A = ADAPTERS[PROVIDER];\nconst callOnce = async (email) => {\n  if (SANDBOX) {\n    const f = (((fx.providers || {})[PROVIDER]) || {})[email];\n    if (f && f.__http) return { http: f.__http, body: f.body || {} };\n    return { http: 200, body: f || (PROVIDER === 'neverbounce' ? { status: 'success', result: 'unknown' } : PROVIDER === 'millionverifier' ? { result: 'unknown', error: '' } : { status: 'unknown' }) };\n  }\n  if (!helpers || typeof helpers.httpRequest !== 'function') return { http: 0, body: null, unavailable: true };\n  try {\n    const res = await helpers.httpRequest({ ...A.request(email), json: true, timeout: TIMEOUT * 1000, returnFullResponse: true, ignoreHttpStatusErrors: true });\n    return { http: Number(res.statusCode) || 0, body: res.body };\n  } catch (e) { return { http: 0, body: null, networkError: String((e && e.code) || 'request_failed') }; }\n};\nconst stats = { provider: PROVIDER, enabled: ENABLED, calls: 0, credits: 0, decided: 0, errors: 0, skipped: 0, circuitOpen: false, reason: null };\nlet consecutive = 0;\nconst pending = items.filter((j) => j.kind === 'email' && !j.decision && j.duplicateOf === undefined);\nif (!ENABLED) { stats.reason = SANDBOX ? 'disabled' : 'not_configured'; stats.skipped = pending.length; }\nfor (let i = 0; ENABLED && i < pending.length; i += CONCURRENCY) {\n  const chunk = [];\n  for (const j of pending.slice(i, i + CONCURRENCY)) {\n    if (stats.circuitOpen) { j.trail.push({ provider: PROVIDER, status: 'skipped', subStatus: 'circuit_open' }); stats.skipped++; continue; }\n    if (stats.calls >= MAX_CALLS) { j.trail.push({ provider: PROVIDER, status: 'skipped', subStatus: 'run_cap_reached' }); stats.skipped++; stats.reason = 'run_cap_reached'; continue; }\n    if (DAILY && budget.used >= DAILY) { j.trail.push({ provider: PROVIDER, status: 'skipped', subStatus: 'daily_budget_reached' }); stats.skipped++; stats.reason = 'daily_budget_reached'; continue; }\n    stats.calls++; budget.used++;\n    chunk.push((async () => {\n      const t0 = Date.now();\n      const res = await callOnce(j.email);\n      let parsed;\n      if (res.unavailable) parsed = { status: 'error', subStatus: 'http_helper_unavailable', fatal: true };\n      else if (res.http === 401 || res.http === 403) parsed = { status: 'error', subStatus: 'auth_failed', fatal: true };\n      else if (res.http === 402) parsed = { status: 'error', subStatus: 'out_of_credits', fatal: true };\n      else if (res.http === 429) parsed = { status: 'error', subStatus: 'rate_limited', fatal: false };\n      else if (!res.http || res.http >= 500) parsed = { status: 'error', subStatus: res.networkError || `http_${res.http || 0}`, fatal: false };\n      else parsed = A.parse(res.body);\n      const entry = { provider: PROVIDER, status: parsed.status, subStatus: parsed.subStatus || null, confidence: parsed.confidence || 0, credit: parsed.credit || 0, ms: Date.now() - t0 };\n      j.trail.push(entry);\n      if (parsed.flags) { if (parsed.flags.didYouMean && !j.didYouMean) j.didYouMean = String(parsed.flags.didYouMean).toLowerCase(); if (parsed.flags.role && !j.flags.includes('role_address')) j.flags.push('role_address'); if (parsed.flags.free && !j.flags.includes('free_mailbox')) j.flags.push('free_mailbox'); }\n      stats.credits += entry.credit;\n      if (parsed.status === 'error') {\n        stats.errors++; consecutive++;\n        if (parsed.fatal || consecutive >= BREAK_AFTER) { stats.circuitOpen = true; stats.reason = parsed.subStatus; }\n        if (budget.used > 0) budget.used--; // failed calls don't consume budget\n        return;\n      }\n      consecutive = 0;\n      if (EARLY.has(parsed.status)) { j.decision = { status: parsed.status, subStatus: parsed.subStatus || null, decidedBy: PROVIDER, confidence: parsed.confidence, definitive: true }; stats.decided++; }\n    })());\n  }\n  await Promise.all(chunk);\n}\nconst prevStats = (first.waterfallStats || []);\nreturn items.map((j) => ({ json: { ...j, waterfallStats: [...prevStats.filter((s) => s.provider !== PROVIDER), stats] } }));\n"
+      },
+      "id": "3f32adff-d236-5b64-8ef5-ef22c08fbdf2",
+      "name": "Waterfall Stage · MillionVerifier",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2640,
+        300
+      ],
+      "notes": "GET /api/v3/ · last resort; catch-all and unknown are free."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Decide Final Verdict                   Mode: Run Once for All Items\n// final status → action:\n//   valid                       → keep\n//   risky (catch-all / role)    → review   (RISKY_ACTION)\n//   unknown                     → retry    (queue rows go back to pending)\n//   invalid                     → suppress + purge candidate\n//   disposable                  → suppress (DISPOSABLE_ACTION)\n//   do_not_mail (trap, abuse…)  → suppress + purge candidate\n//   suppressed (already listed) → suppress\n// Nothing is deleted: purge candidates are flags for a person to confirm.\n// Duplicates in the batch copy the verdict of their first occurrence.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst items = $input.all().map((i) => i.json);\nconst RISKY_ACTION = env('RISKY_ACTION', 'review').toLowerCase();\nconst DISPOSABLE_ACTION = env('DISPOSABLE_ACTION', 'suppress').toLowerCase();\nconst PURGE_STATUSES = new Set(csv('PURGE_CANDIDATE_STATUSES', 'invalid,do_not_mail'));\nconst verdict = (j) => {\n  let d = j.decision;\n  if (!d) {\n    const t = j.trail || [];\n    const catchAll = t.filter((x) => x.status === 'catch_all').pop();\n    const allErrors = t.length && t.every((x) => x.status === 'error' || x.status === 'skipped');\n    d = catchAll ? { status: 'risky', subStatus: 'catch_all', decidedBy: catchAll.provider, confidence: 50, definitive: false }\n      : { status: 'unknown', subStatus: allErrors ? 'providers_unavailable' : (t.length ? 'unverifiable' : 'no_provider_called'), decidedBy: t.length ? t[t.length - 1].provider : 'none', confidence: 0, definitive: false };\n  }\n  const s = d.status;\n  const action = s === 'valid' ? 'keep' : s === 'risky' ? (RISKY_ACTION === 'keep' ? 'keep' : 'review') : s === 'unknown' ? 'retry'\n    : s === 'disposable' ? (DISPOSABLE_ACTION === 'review' ? 'review' : 'suppress') : 'suppress';\n  const suppressReason = action !== 'suppress' || s === 'suppressed' ? null : s === 'invalid' ? (d.subStatus === 'syntax' ? 'syntax' : d.subStatus === 'no_mx' ? 'no_mx' : 'hard_invalid')\n    : s === 'disposable' ? 'disposable' : (d.subStatus === 'spamtrap' || d.subStatus === 'abuse') ? d.subStatus : 'do_not_mail';\n  return { ...d, action, suppressReason, purgeCandidate: PURGE_STATUSES.has(s) };\n};\nconst byPos = new Map();\nconst out = items.map((j) => {\n  if (j.kind !== 'email' || j.duplicateOf !== undefined) return j;\n  const v = verdict(j);\n  const r = { ...j, kind: 'verified', verdict: v, credits: (j.trail || []).reduce((a, x) => a + (x.credit || 0), 0), apiCalls: (j.trail || []).filter((x) => !['skipped'].includes(x.status)).length };\n  byPos.set(j.position, r);\n  return r;\n});\nreturn out.map((j) => {\n  if (j.kind === 'email' && j.duplicateOf !== undefined) {\n    const o = byPos.get(j.duplicateOf);\n    return { json: { ...j, kind: 'verified', verdict: o ? { ...o.verdict, decidedBy: `duplicate:${o.verdict.decidedBy}` } : { status: 'unknown', subStatus: 'duplicate', action: 'retry', decidedBy: 'duplicate', confidence: 0 }, credits: 0, apiCalls: 0, duplicate: true } };\n  }\n  return { json: j };\n});\n"
+      },
+      "id": "1a2381d8-4bfd-5788-9867-0cb133c9962a",
+      "name": "Decide Final Verdict",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2880,
+        300
+      ],
+      "notes": "keep · review · retry · suppress · purge candidate (never deletes)."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Build Persist Statement                Mode: Run Once for All Items\n// One item with two base64 parameters for a single transactional SQL\n// statement: result rows (hash, domain, verdict, provider trail — plaintext\n// address only when STORE_EMAIL_PLAINTEXT=true), suppression upserts,\n// queue updates and one run summary.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst items = $input.all().map((i) => i.json);\nconst first = items[0] || {};\nconst run = first.run || {};\nconst STORE_PLAIN = flag('STORE_EMAIL_PLAINTEXT', false);\nconst verified = items.filter((j) => j.kind === 'verified');\nconst rows = verified.map((j) => ({\n  queue_id: j.queueId ?? null, email_hash: j.emailHash, email_domain: j.domain, email: STORE_PLAIN ? j.email : null,\n  final_status: j.verdict.status, sub_status: j.verdict.subStatus || null, confidence: Math.round(j.verdict.confidence || 0), decided_by: j.verdict.decidedBy, action: j.verdict.action,\n  provider_trail: (j.trail || []).map((t) => ({ p: t.provider, s: t.status, ss: t.subStatus, c: t.credit, ms: t.ms })), credits_used: j.credits || 0, source: j.origin,\n  persist_result: !j.duplicate && j.verdict.status !== 'suppressed' && !String(j.verdict.decidedBy || '').startsWith('cache:'),\n  suppress_reason: j.duplicate ? null : j.verdict.suppressReason, purge_candidate: !!j.verdict.purgeCandidate, retry: j.verdict.action === 'retry',\n}));\nconst stats = (verified.find((j) => j.waterfallStats) || first).waterfallStats || [];\nconst count = (f) => verified.reduce((m, j) => { const k = f(j); m[k] = (m[k] || 0) + 1; return m; }, {});\nconst runRow = { run_id: run.runId, origin: run.origin, mode: run.mode, started_at: run.startedAt, received: verified.length, max_attempts: Math.max(1, num('QUEUE_MAX_ATTEMPTS', 3)),\n  api_calls: Object.fromEntries(stats.map((s) => [s.provider, s.calls])), credits: Object.fromEntries(stats.map((s) => [s.provider, s.credits])),\n  outcomes: count((j) => j.verdict.status), early_exits: count((j) => j.verdict.decidedBy) };\nconst b64 = (o) => Buffer.from(JSON.stringify(o)).toString('base64');\nreturn [{ json: { run, sandboxFixtures: first.sandboxFixtures || null, rowCount: rows.length, p1: b64(rows), p2: b64(runRow), runRow } }];\n"
+      },
+      "id": "c28f297c-f4e5-5e84-9882-485d0a36caa3",
+      "name": "Build Persist Statement",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3120,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "aa7adfed-f4ff-5846-83a3-565eb9c7e2ac",
+              "leftValue": "={{ !$json.run.sandboxMode && !$json.run.dryRun }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "1292a41d-b6d2-5a14-b0e3-ad67fc27e085",
+      "name": "Live DB Write?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3360,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Simulate Persist (Sandbox / Dry Run)   Mode: Run Once for All Items\n// Same counters the SQL returns. Nothing is written.\n// ─────────────────────────────────────────────────────────────────────\nconst j = $input.first().json;\nconst rows = JSON.parse(Buffer.from(j.p1, 'base64').toString('utf8'));\nreturn [{ json: { simulated: true, results_written: rows.filter((r) => r.persist_result).length, suppression_upserts: rows.filter((r) => r.suppress_reason).length,\n  queue_rows_updated: rows.filter((r) => r.queue_id !== null).length, run_rows: 1 } }];\n"
+      },
+      "id": "ed985f5c-c3df-5df4-a179-97c4bd1bcd70",
+      "name": "Simulate Persist (Sandbox / Dry Run)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3600,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH input AS (\n  SELECT * FROM json_to_recordset(convert_from(decode($1, 'base64'), 'UTF8')::json) AS x(\n    queue_id bigint, email_hash text, email_domain text, email text, final_status text, sub_status text, confidence int, decided_by text, action text,\n    provider_trail jsonb, credits_used numeric, source text, persist_result boolean, suppress_reason text, purge_candidate boolean, retry boolean)\n), meta AS (SELECT convert_from(decode($2, 'base64'), 'UTF8')::json AS j\n), ins AS (\n  INSERT INTO email_verification_results (run_id, email_hash, email_domain, email, final_status, sub_status, confidence, decided_by, action, provider_trail, credits_used, source)\n  SELECT (SELECT j->>'run_id' FROM meta), email_hash, email_domain, email, final_status, sub_status, confidence, decided_by, action, COALESCE(provider_trail, '[]'::jsonb), COALESCE(credits_used, 0), source\n    FROM input WHERE persist_result\n     AND NOT EXISTS (SELECT 1 FROM email_verification_runs er WHERE er.run_id = (SELECT j->>'run_id' FROM meta))\n  RETURNING 1\n), sup AS (\n  INSERT INTO email_suppression (email_hash, email_domain, email, reason, source_status, purge_candidate)\n  SELECT DISTINCT ON (email_hash) email_hash, email_domain, email, suppress_reason, final_status, COALESCE(purge_candidate, false)\n    FROM input WHERE suppress_reason IS NOT NULL\n  ON CONFLICT (email_hash) DO UPDATE\n     SET last_seen_at = now(), reason = EXCLUDED.reason, source_status = EXCLUDED.source_status,\n         purge_candidate = email_suppression.purge_candidate OR EXCLUDED.purge_candidate\n  RETURNING 1\n), q AS (\n  UPDATE email_verification_queue qq\n     SET status = CASE WHEN i.retry AND qq.attempts < (SELECT (j->>'max_attempts')::int FROM meta) THEN 'pending' WHEN i.retry THEN 'failed' ELSE 'done' END,\n         final_status = i.final_status, action = i.action, processed_at = now(), run_id = (SELECT j->>'run_id' FROM meta)\n    FROM input i\n   WHERE i.queue_id IS NOT NULL AND qq.id = i.queue_id\n  RETURNING 1\n), run AS (\n  INSERT INTO email_verification_runs (run_id, origin, mode, started_at, finished_at, received, api_calls, credits, outcomes, early_exits)\n  SELECT j->>'run_id', j->>'origin', j->>'mode', (j->>'started_at')::timestamptz, now(), (j->>'received')::int, j->'api_calls', j->'credits', j->'outcomes', j->'early_exits' FROM meta\n  ON CONFLICT (run_id) DO NOTHING\n  RETURNING 1\n)\nSELECT (SELECT count(*) FROM ins) AS results_written, (SELECT count(*) FROM sup) AS suppression_upserts,\n       (SELECT count(*) FROM q) AS queue_rows_updated, (SELECT count(*) FROM run) AS run_rows;",
+        "options": {
+          "queryReplacement": "={{ $json.p1 }},{{ $json.p2 }}"
+        }
+      },
+      "id": "969c2a35-dae0-56ae-8fdd-611b38e83df2",
+      "name": "Persist Results & Suppression",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        3600,
+        380
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "YOUR_POSTGRES_CREDENTIAL_ID",
+          "name": "Postgres · email verification (YOUR_POSTGRES_URL)"
+        }
+      },
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "notes": "One transaction: results · suppression upserts · queue updates · run summary. Not auto-retried."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Build Response & Audit                 Mode: Run Once for All Items\n// Webhook response (the caller gets its own addresses back with a verdict)\n// and the sanitized audit: hashed email refs, statuses, deciding step,\n// provider path, credits and the persistence counters. No addresses, no\n// API keys. Ring buffer in static data (not in sandbox).\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst KNOWN_SECRETS = ['ZEROBOUNCE_API_KEY', 'NEVERBOUNCE_API_KEY', 'MILLIONVERIFIER_API_KEY', 'VERIFY_WEBHOOK_SECRET', 'POSTGRES_URL', 'EMAIL_HASH_PEPPER', 'SLACK_WEBHOOK_URL']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|cookie|signature|webhook[-_]?url)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  s = s.replace(/(postgres(?:ql)?:\\/\\/[^:\\s\\/]+:)[^@\\s]+@/gi, '$1[REDACTED]@');\n  return s\n    .replace(/\\beyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{4,}/g, '[REDACTED_JWT]')\n    .replace(/Basic\\s+[A-Za-z0-9+\\/]{8,}=*/gi, 'Basic [REDACTED]')\n    .replace(/Token\\s+token=[^\\s\"',]+/gi, 'Token token=[REDACTED]')\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bsk-[A-Za-z0-9_\\-]{16,}/g, '[REDACTED_OPENAI_KEY]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\\s\\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, '[REDACTED_PRIVATE_KEY]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/([?&](?:api_key|apikey|api|key|token|secret|signature|sig|password)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 60).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') {\n    const out = {};\n    for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1);\n    return out;\n  }\n  return value;\n};\n\nconst items = $('Decide Final Verdict').all().map((i) => i.json);\nconst persist = $input.first().json || {};\nconst first = items[0] || {};\nconst run = first.run || {};\nconst INCLUDE_EMAIL = flag('RESPONSE_INCLUDE_EMAIL', true);\nconst rejected = items.find((j) => j.kind === 'rejected');\nconst verified = items.filter((j) => j.kind === 'verified').sort((a, b) => a.position - b.position);\nconst stats = (verified.find((j) => j.waterfallStats) || {}).waterfallStats || [];\nconst tally = (f) => verified.reduce((m, j) => { const k = f(j); m[k] = (m[k] || 0) + 1; return m; }, {});\nconst summary = { received: verified.length, byStatus: tally((j) => j.verdict.status), byAction: tally((j) => j.verdict.action), decidedBy: tally((j) => j.verdict.decidedBy),\n  apiCalls: Object.fromEntries(stats.map((s) => [s.provider, s.calls])), credits: Object.fromEntries(stats.map((s) => [s.provider, s.credits])),\n  totalCredits: stats.reduce((a, s) => a + s.credits, 0), callsAvoided: verified.filter((j) => j.apiCalls === 0).length,\n  providers: stats.map((s) => ({ provider: s.provider, enabled: s.enabled, calls: s.calls, decided: s.decided, errors: s.errors, skipped: s.skipped, circuitOpen: s.circuitOpen, reason: s.reason })) };\nconst persistence = { simulated: !!persist.simulated, resultsWritten: Number(persist.results_written || 0), suppressionUpserts: Number(persist.suppression_upserts || 0),\n  queueRowsUpdated: Number(persist.queue_rows_updated || 0), error: persist.error ? redactString(persist.error.message || persist.error) : null };\nconst audit = { record: rejected ? 'request_rejected' : 'verification_run', at: new Date().toISOString(), runId: run.runId || null, mode: run.mode || null, origin: run.origin || null,\n  reason: rejected ? rejected.reason : null, summary, persistence,\n  emails: verified.map((j) => ({ ref: j.emailRef, status: j.verdict.status, subStatus: j.verdict.subStatus || null, action: j.verdict.action, decidedBy: j.verdict.decidedBy,\n    path: (j.trail || []).map((t) => `${t.provider}:${t.status}`), credits: j.credits, flags: j.flags || [], duplicate: !!j.duplicate })) };\nconst safe = redact(audit);\nif (flag('AUDIT_LOG_TO_STDOUT', true)) { try { console.log(`[email-waterfall:audit] ${JSON.stringify(safe)}`); } catch (e) { /* best effort */ } }\nif (!run.sandboxMode) { const sd = $getWorkflowStaticData('global'); sd.emailWaterfallAudit = [...(sd.emailWaterfallAudit || []), safe].slice(-Math.min(500, Math.max(20, num('AUDIT_RING_BUFFER_SIZE', 200)))); }\nconst response = rejected ? { ok: false, error: rejected.reason, runId: run.runId || null }\n  : { ok: true, runId: run.runId, mode: run.mode, summary: { received: summary.received, byStatus: summary.byStatus, byAction: summary.byAction, totalCredits: summary.totalCredits, callsAvoided: summary.callsAvoided },\n    results: verified.map((j) => ({ ...(INCLUDE_EMAIL ? { email: j.email } : {}), ref: j.ref || null, emailRef: j.emailRef, status: j.verdict.status, subStatus: j.verdict.subStatus || null,\n      action: j.verdict.action, purgeCandidate: !!j.verdict.purgeCandidate, decidedBy: j.verdict.decidedBy, confidence: j.verdict.confidence || 0, didYouMean: j.didYouMean || null, flags: j.flags || [] })) };\nreturn [{ json: { origin: run.origin || null, httpCode: rejected ? rejected.httpCode : 200, response, audit: safe } }];\n"
+      },
+      "id": "670a8f2a-735a-5e09-8803-8b1c5caf5ffe",
+      "name": "Build Response & Audit",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3840,
+        300
+      ],
+      "notes": "Hashed refs, statuses, credits · no addresses or keys in logs."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "594d4c4c-3f1b-5e8f-9179-915416451311",
+              "leftValue": "={{ $json.origin }}",
+              "rightValue": "webhook",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "5bee784a-2e85-5060-a4f4-9cdc40b3e656",
+      "name": "From Webhook?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4080,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json.response) }}",
+        "options": {
+          "responseCode": "={{ $json.httpCode }}"
+        }
+      },
+      "id": "10333b72-2022-5a2f-9173-0c90fe7a7455",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        4320,
+        220
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "d017c72c-2df3-51b9-9294-75f289196b23",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        820
+      ],
+      "notes": "Fires when this workflow is selected as its own Error Workflow."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Sanitized Error Handler              Mode: Run Once for All Items\n// Fed by the Error Trigger when this workflow is its own Error Workflow.\n// Drops stack traces and request options, redacts secrets, and emits a\n// safe alert record (and optionally a minimal Slack notice).\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst KNOWN_SECRETS = ['ZEROBOUNCE_API_KEY', 'NEVERBOUNCE_API_KEY', 'MILLIONVERIFIER_API_KEY', 'VERIFY_WEBHOOK_SECRET', 'POSTGRES_URL', 'EMAIL_HASH_PEPPER', 'SLACK_WEBHOOK_URL']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|cookie|signature|webhook[-_]?url)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  s = s.replace(/(postgres(?:ql)?:\\/\\/[^:\\s\\/]+:)[^@\\s]+@/gi, '$1[REDACTED]@');\n  return s\n    .replace(/\\beyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{4,}/g, '[REDACTED_JWT]')\n    .replace(/Basic\\s+[A-Za-z0-9+\\/]{8,}=*/gi, 'Basic [REDACTED]')\n    .replace(/Token\\s+token=[^\\s\"',]+/gi, 'Token token=[REDACTED]')\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bsk-[A-Za-z0-9_\\-]{16,}/g, '[REDACTED_OPENAI_KEY]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\\s\\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, '[REDACTED_PRIVATE_KEY]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/([?&](?:api_key|apikey|api|key|token|secret|signature|sig|password)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 60).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') {\n    const out = {};\n    for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1);\n    return out;\n  }\n  return value;\n};\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\n\nreturn $input.all().map(({ json }) => {\n  const execution = json.execution || {};\n  const error = execution.error || (json.trigger && json.trigger.error) || {};\n  const alert = {\n    alertType: 'email_waterfall_execution_error',\n    at: new Date().toISOString(),\n    workflow: { id: json.workflow ? json.workflow.id : null, name: redactString(json.workflow ? json.workflow.name : '') },\n    execution: { id: execution.id || null, mode: execution.mode || null, retryOf: execution.retryOf || null },\n    lastNodeExecuted: execution.lastNodeExecuted || null,\n    errorName: redactString(error.name || 'Error'),\n    errorMessage: redactString(error.message || 'unknown error').slice(0, 300),\n    nextStep: 'Open the execution in n8n (restricted access) and check the node named in lastNodeExecuted.',\n  };\n  try { console.error(`[email-waterfall:error] ${JSON.stringify(alert)}`); } catch (e) { /* best effort */ }\n  const notify = !SANDBOX_MODE && !DRY_RUN && env('SLACK_WEBHOOK_URL', '') !== '' && flag('SLACK_NOTIFY_ON_MONITOR_ERROR', true);\n  return {\n    json: {\n      ...alert,\n      notify,\n      slackMessage: {\n        text: `Email verification waterfall failed at ${alert.lastNodeExecuted || 'unknown node'}`,\n        blocks: [\n          { type: 'header', text: { type: 'plain_text', text: '⚠️ Email verification waterfall failed', emoji: true } },\n          { type: 'section', text: { type: 'mrkdwn', text: `*Node:* ${alert.lastNodeExecuted || 'unknown'}\\n*Error:* ${alert.errorName}: ${alert.errorMessage}` } },\n          { type: 'context', elements: [{ type: 'mrkdwn', text: `Execution \\`${alert.execution.id || 'n/a'}\\` · claimed queue rows return to pending after 30 minutes and are retried` }] },\n        ],\n      },\n    },\n  };\n});\n"
+      },
+      "id": "8d4d4b5c-70a4-5e9a-8fcf-29e9af1825c7",
+      "name": "Sanitized Error Handler",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        820
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "303fe32b-2c53-514e-989f-465716eb6d00",
+              "leftValue": "={{ $json.notify }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "db11110c-d49c-5a0d-80ba-c2b5d5eff21b",
+      "name": "Notify Execution Error?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        820
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "options": {
+          "timeout": 10000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.slackMessage) }}"
+      },
+      "id": "04dd0e26-b4dd-5ec7-80ac-dde914e32228",
+      "name": "Post Execution Error Notice",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        760
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "content": "## n8n-email-verification-cascading-waterfall-engine\nFree pre-filters → cache & suppression → ZeroBounce → NeverBounce → MillionVerifier (early exit) → verdict → PostgreSQL. DH Robin · dhRobin Systems.\n\n**Safe defaults:** `SANDBOX_MODE=true`, `DRY_RUN=true`. No provider or database calls in sandbox; no database writes in dry run.\n\n**Stage 1** Execute the webhook and the queue trigger with their pinned fictional data.\n**Stage 2** `SANDBOX_MODE=false`: test API keys + staging database, writes simulated.\n**Stage 3** `DRY_RUN=false`: results, suppression and queue updates are written.\n\nNothing is ever deleted: purge candidates are flags for a person to confirm.",
+        "height": 330,
+        "width": 760,
+        "color": 4
+      },
+      "id": "7fa757db-76e4-5540-b5b5-4502d70a9ae1",
+      "name": "Sticky: Start Here",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -360
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Cascading waterfall\nEach stage calls its provider only for emails still undecided · run caps, daily budgets and a circuit breaker per provider.",
+        "height": 110,
+        "width": 700,
+        "color": 3
+      },
+      "id": "9e3b29ec-f1b7-5161-aa32-53fffe8a1ab9",
+      "name": "Sticky: Waterfall",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        2120,
+        -40
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Sanitized error path\nNo stack traces, headers or bodies. API keys, database passwords and webhook URLs are redacted.",
+        "height": 90,
+        "width": 600,
+        "color": 2
+      },
+      "id": "75397a26-6df5-5bcd-8fc3-b52d07f4c178",
+      "name": "Sticky: Errors",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        700
+      ]
+    }
+  ],
+  "connections": {
+    "Verify Emails Webhook": {
+      "main": [
+        [
+          {
+            "node": "Verify & Unwrap Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify & Unwrap Request": {
+      "main": [
+        [
+          {
+            "node": "Syntax & Disposable Pre-filter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Queue Batch Trigger": {
+      "main": [
+        [
+          {
+            "node": "Sandbox Queue?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sandbox Queue?": {
+      "main": [
+        [
+          {
+            "node": "Load Queue Fixtures (Sandbox)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Claim Queue Batch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Queue Fixtures (Sandbox)": {
+      "main": [
+        [
+          {
+            "node": "Package Queue Batch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim Queue Batch": {
+      "main": [
+        [
+          {
+            "node": "Package Queue Batch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Package Queue Batch": {
+      "main": [
+        [
+          {
+            "node": "Syntax & Disposable Pre-filter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Syntax & Disposable Pre-filter": {
+      "main": [
+        [
+          {
+            "node": "Build Cache Query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Cache Query": {
+      "main": [
+        [
+          {
+            "node": "Sandbox DB Read?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sandbox DB Read?": {
+      "main": [
+        [
+          {
+            "node": "Simulate Cache Lookup (Sandbox)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Lookup Cache & Suppression",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simulate Cache Lookup (Sandbox)": {
+      "main": [
+        [
+          {
+            "node": "Apply Cache & Suppression",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lookup Cache & Suppression": {
+      "main": [
+        [
+          {
+            "node": "Apply Cache & Suppression",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Cache & Suppression": {
+      "main": [
+        [
+          {
+            "node": "Waterfall Stage · ZeroBounce",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Waterfall Stage · ZeroBounce": {
+      "main": [
+        [
+          {
+            "node": "Waterfall Stage · NeverBounce",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Waterfall Stage · NeverBounce": {
+      "main": [
+        [
+          {
+            "node": "Waterfall Stage · MillionVerifier",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Waterfall Stage · MillionVerifier": {
+      "main": [
+        [
+          {
+            "node": "Decide Final Verdict",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decide Final Verdict": {
+      "main": [
+        [
+          {
+            "node": "Build Persist Statement",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Persist Statement": {
+      "main": [
+        [
+          {
+            "node": "Live DB Write?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Live DB Write?": {
+      "main": [
+        [
+          {
+            "node": "Persist Results & Suppression",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Simulate Persist (Sandbox / Dry Run)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simulate Persist (Sandbox / Dry Run)": {
+      "main": [
+        [
+          {
+            "node": "Build Response & Audit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Persist Results & Suppression": {
+      "main": [
+        [
+          {
+            "node": "Build Response & Audit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Response & Audit": {
+      "main": [
+        [
+          {
+            "node": "From Webhook?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "From Webhook?": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Sanitized Error Handler",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitized Error Handler": {
+      "main": [
+        [
+          {
+            "node": "Notify Execution Error?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Execution Error?": {
+      "main": [
+        [
+          {
+            "node": "Post Execution Error Notice",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "pinData": {
+    "Verify Emails Webhook": [
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "x-signature": "sha256=8c989dad2d9a9c62c217a7866c0c2d5fb8de8000e23f495e12492932ace97aa5",
+            "x-timestamp": "1794812400"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "list_id": "fx-list-spring-webinar",
+            "emails": [
+              "dana.whitfield@northwind-fixture.example",
+              "lee.park@northwind-fixture.example",
+              "old.employee@contoso-fixture.example",
+              "jordan.lee@contoso-fixture.example",
+              "sam@harbor-fixture.example",
+              "not-an-email@@harbor-fixture.example",
+              "promo.signup@throwaway-fixture.example",
+              {
+                "email": "info@globex-fixture.example",
+                "ref": "crm-1008"
+              },
+              "Dana.Whitfield@Northwind-Fixture.example",
+              "already.suppressed@initrode-fixture.example",
+              "cached.valid@umbrella-fixture.example",
+              "trap@initrode-fixture.example",
+              "nobody@nomail-fixture.example",
+              "casey.morgan@gmial-fixture.example"
+            ]
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/email-waterfall/verify",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT 14 emails · 6 answered without any API call · ZeroBounce 8 calls, NeverBounce 3, MillionVerifier 2 · 9 credits",
+          "sandboxFixtures": {
+            "now": "2026-11-16T09:00:00Z",
+            "config": {
+              "disposableDomains": [
+                "throwaway-fixture.example"
+              ],
+              "mxCheck": true,
+              "noMxDomains": [
+                "nomail-fixture.example"
+              ],
+              "typoMap": {
+                "gmial-fixture.example": "gmail-fixture.example"
+              }
+            },
+            "providers": {
+              "zerobounce": {
+                "dana.whitfield@northwind-fixture.example": {
+                  "address": "fixture",
+                  "status": "valid",
+                  "sub_status": "",
+                  "free_email": false,
+                  "did_you_mean": null,
+                  "domain": "fixture",
+                  "mx_found": "true",
+                  "processed_at": "2026-11-16 08:59:00.000"
+                },
+                "lee.park@northwind-fixture.example": {
+                  "address": "fixture",
+                  "status": "catch-all",
+                  "sub_status": "",
+                  "free_email": false,
+                  "did_you_mean": null,
+                  "domain": "fixture",
+                  "mx_found": "true",
+                  "processed_at": "2026-11-16 08:59:00.000"
+                },
+                "old.employee@contoso-fixture.example": {
+                  "address": "fixture",
+                  "status": "invalid",
+                  "sub_status": "mailbox_not_found",
+                  "free_email": false,
+                  "did_you_mean": null,
+                  "domain": "fixture",
+                  "mx_found": "true",
+                  "processed_at": "2026-11-16 08:59:00.000"
+                },
+                "jordan.lee@contoso-fixture.example": {
+                  "address": "fixture",
+                  "status": "unknown",
+                  "sub_status": "greylisted",
+                  "free_email": false,
+                  "did_you_mean": null,
+                  "domain": "fixture",
+                  "mx_found": "true",
+                  "processed_at": "2026-11-16 08:59:00.000"
+                },
+                "sam@harbor-fixture.example": {
+                  "address": "fixture",
+                  "status": "unknown",
+                  "sub_status": "mail_server_did_not_respond",
+                  "free_email": false,
+                  "did_you_mean": null,
+                  "domain": "fixture",
+                  "mx_found": "true",
+                  "processed_at": "2026-11-16 08:59:00.000"
+                },
+                "info@globex-fixture.example": {
+                  "address": "fixture",
+                  "status": "do_not_mail",
+                  "sub_status": "role_based",
+                  "free_email": false,
+                  "did_you_mean": null,
+                  "domain": "fixture",
+                  "mx_found": "true",
+                  "processed_at": "2026-11-16 08:59:00.000"
+                },
+                "trap@initrode-fixture.example": {
+                  "address": "fixture",
+                  "status": "spamtrap",
+                  "sub_status": "",
+                  "free_email": false,
+                  "did_you_mean": null,
+                  "domain": "fixture",
+                  "mx_found": "true",
+                  "processed_at": "2026-11-16 08:59:00.000"
+                },
+                "casey.morgan@gmial-fixture.example": {
+                  "address": "fixture",
+                  "status": "valid",
+                  "sub_status": "",
+                  "free_email": true,
+                  "did_you_mean": "casey.morgan@gmail-fixture.example",
+                  "domain": "fixture",
+                  "mx_found": "true",
+                  "processed_at": "2026-11-16 08:59:00.000"
+                },
+                "riley.brooks@harbor-fixture.example": {
+                  "__http": 200,
+                  "body": {
+                    "error": "Invalid API Key or your account ran out of credits"
+                  }
+                },
+                "casey.morgan@globex-fixture.example": {
+                  "address": "fixture",
+                  "status": "valid",
+                  "sub_status": "",
+                  "free_email": false,
+                  "did_you_mean": null,
+                  "domain": "fixture",
+                  "mx_found": "true",
+                  "processed_at": "2026-11-16 08:59:00.000"
+                }
+              },
+              "neverbounce": {
+                "lee.park@northwind-fixture.example": {
+                  "status": "success",
+                  "result": "catchall",
+                  "flags": [
+                    "has_dns",
+                    "has_dns_mx"
+                  ],
+                  "suggested_correction": "",
+                  "retry_token": "",
+                  "execution_time": 412
+                },
+                "jordan.lee@contoso-fixture.example": {
+                  "status": "success",
+                  "result": "valid",
+                  "flags": [
+                    "has_dns",
+                    "has_dns_mx"
+                  ],
+                  "suggested_correction": "",
+                  "retry_token": "",
+                  "execution_time": 412
+                },
+                "sam@harbor-fixture.example": {
+                  "status": "success",
+                  "result": "unknown",
+                  "flags": [
+                    "has_dns",
+                    "has_dns_mx"
+                  ],
+                  "suggested_correction": "",
+                  "retry_token": "",
+                  "execution_time": 412
+                },
+                "riley.brooks@harbor-fixture.example": {
+                  "status": "success",
+                  "result": "valid",
+                  "flags": [
+                    "has_dns",
+                    "has_dns_mx"
+                  ],
+                  "suggested_correction": "",
+                  "retry_token": "",
+                  "execution_time": 412
+                },
+                "taylor.ng@harbor-fixture.example": {
+                  "status": "success",
+                  "result": "disposable",
+                  "flags": [
+                    "has_dns",
+                    "has_dns_mx"
+                  ],
+                  "suggested_correction": "",
+                  "retry_token": "",
+                  "execution_time": 412
+                },
+                "morgan.diaz@contoso-fixture.example": {
+                  "status": "success",
+                  "result": "catchall",
+                  "flags": [
+                    "has_dns",
+                    "has_dns_mx"
+                  ],
+                  "suggested_correction": "",
+                  "retry_token": "",
+                  "execution_time": 412
+                }
+              },
+              "millionverifier": {
+                "lee.park@northwind-fixture.example": {
+                  "email": "fixture",
+                  "quality": "risky",
+                  "result": "catch_all",
+                  "resultcode": 2,
+                  "subresult": "unknown",
+                  "free": false,
+                  "role": false,
+                  "didyoumean": "",
+                  "credits": 4321,
+                  "executiontime": 2,
+                  "error": "",
+                  "livemode": true
+                },
+                "sam@harbor-fixture.example": {
+                  "email": "fixture",
+                  "quality": "bad",
+                  "result": "invalid",
+                  "resultcode": 6,
+                  "subresult": "mailbox_not_found",
+                  "free": false,
+                  "role": false,
+                  "didyoumean": "",
+                  "credits": 4321,
+                  "executiontime": 2,
+                  "error": "",
+                  "livemode": true
+                },
+                "morgan.diaz@contoso-fixture.example": {
+                  "__http": 200,
+                  "body": {
+                    "error": "Insufficient credits",
+                    "result": "",
+                    "credits": 0
+                  }
+                }
+              }
+            },
+            "dbRows": [
+              {
+                "email_hash": "37613f3067500438f182a8feaabb7a4fb0f5e526b8a89d46b5439470365ea940",
+                "final_status": null,
+                "sub_status": null,
+                "confidence": null,
+                "decided_by": null,
+                "verified_at": null,
+                "suppressed_reason": "hard_invalid"
+              },
+              {
+                "email_hash": "808fd7415198b8fafb2e76b06ca487eda6ddccbfc71293721a188e6a0e49f4a9",
+                "final_status": "valid",
+                "sub_status": null,
+                "confidence": 95,
+                "decided_by": "zerobounce",
+                "verified_at": "2026-11-11T10:00:00Z",
+                "suppressed_reason": null
+              }
+            ],
+            "queue": [
+              {
+                "id": 101,
+                "email": "casey.morgan@globex-fixture.example",
+                "list_id": "fx-list-import",
+                "external_ref": "row-1"
+              },
+              {
+                "id": 102,
+                "email": "riley.brooks@harbor-fixture.example",
+                "list_id": "fx-list-import",
+                "external_ref": "row-2"
+              },
+              {
+                "id": 103,
+                "email": "taylor.ng@harbor-fixture.example",
+                "list_id": "fx-list-import",
+                "external_ref": "row-3"
+              },
+              {
+                "id": 104,
+                "email": "morgan.diaz@contoso-fixture.example",
+                "list_id": "fx-list-import",
+                "external_ref": "row-4"
+              }
+            ]
+          }
+        }
+      }
+    ],
+    "Queue Batch Trigger": [
+      {
+        "json": {
+          "timestamp": "2026-11-16T09:00:00.000+00:00",
+          "Readable date": "November 16th 2026, 9:00:00 am",
+          "Timezone": "UTC",
+          "sandboxFixtures": {
+            "now": "2026-11-16T09:00:00Z",
+            "config": {
+              "disposableDomains": [
+                "throwaway-fixture.example"
+              ],
+              "mxCheck": true,
+              "noMxDomains": [
+                "nomail-fixture.example"
+              ],
+              "typoMap": {
+                "gmial-fixture.example": "gmail-fixture.example"
+              }
+            },
+            "providers": {
+              "zerobounce": {
+                "dana.whitfield@northwind-fixture.example": {
+                  "address": "fixture",
+                  "status": "valid",
+                  "sub_status": "",
+                  "free_email": false,
+                  "did_you_mean": null,
+                  "domain": "fixture",
+                  "mx_found": "true",
+                  "processed_at": "2026-11-16 08:59:00.000"
+                },
+                "lee.park@northwind-fixture.example": {
+                  "address": "fixture",
+                  "status": "catch-all",
+                  "sub_status": "",
+                  "free_email": false,
+                  "did_you_mean": null,
+                  "domain": "fixture",
+                  "mx_found": "true",
+                  "processed_at": "2026-11-16 08:59:00.000"
+                },
+                "old.employee@contoso-fixture.example": {
+                  "address": "fixture",
+                  "status": "invalid",
+                  "sub_status": "mailbox_not_found",
+                  "free_email": false,
+                  "did_you_mean": null,
+                  "domain": "fixture",
+                  "mx_found": "true",
+                  "processed_at": "2026-11-16 08:59:00.000"
+                },
+                "jordan.lee@contoso-fixture.example": {
+                  "address": "fixture",
+                  "status": "unknown",
+                  "sub_status": "greylisted",
+                  "free_email": false,
+                  "did_you_mean": null,
+                  "domain": "fixture",
+                  "mx_found": "true",
+                  "processed_at": "2026-11-16 08:59:00.000"
+                },
+                "sam@harbor-fixture.example": {
+                  "address": "fixture",
+                  "status": "unknown",
+                  "sub_status": "mail_server_did_not_respond",
+                  "free_email": false,
+                  "did_you_mean": null,
+                  "domain": "fixture",
+                  "mx_found": "true",
+                  "processed_at": "2026-11-16 08:59:00.000"
+                },
+                "info@globex-fixture.example": {
+                  "address": "fixture",
+                  "status": "do_not_mail",
+                  "sub_status": "role_based",
+                  "free_email": false,
+                  "did_you_mean": null,
+                  "domain": "fixture",
+                  "mx_found": "true",
+                  "processed_at": "2026-11-16 08:59:00.000"
+                },
+                "trap@initrode-fixture.example": {
+                  "address": "fixture",
+                  "status": "spamtrap",
+                  "sub_status": "",
+                  "free_email": false,
+                  "did_you_mean": null,
+                  "domain": "fixture",
+                  "mx_found": "true",
+                  "processed_at": "2026-11-16 08:59:00.000"
+                },
+                "casey.morgan@gmial-fixture.example": {
+                  "address": "fixture",
+                  "status": "valid",
+                  "sub_status": "",
+                  "free_email": true,
+                  "did_you_mean": "casey.morgan@gmail-fixture.example",
+                  "domain": "fixture",
+                  "mx_found": "true",
+                  "processed_at": "2026-11-16 08:59:00.000"
+                },
+                "riley.brooks@harbor-fixture.example": {
+                  "__http": 200,
+                  "body": {
+                    "error": "Invalid API Key or your account ran out of credits"
+                  }
+                },
+                "casey.morgan@globex-fixture.example": {
+                  "address": "fixture",
+                  "status": "valid",
+                  "sub_status": "",
+                  "free_email": false,
+                  "did_you_mean": null,
+                  "domain": "fixture",
+                  "mx_found": "true",
+                  "processed_at": "2026-11-16 08:59:00.000"
+                }
+              },
+              "neverbounce": {
+                "lee.park@northwind-fixture.example": {
+                  "status": "success",
+                  "result": "catchall",
+                  "flags": [
+                    "has_dns",
+                    "has_dns_mx"
+                  ],
+                  "suggested_correction": "",
+                  "retry_token": "",
+                  "execution_time": 412
+                },
+                "jordan.lee@contoso-fixture.example": {
+                  "status": "success",
+                  "result": "valid",
+                  "flags": [
+                    "has_dns",
+                    "has_dns_mx"
+                  ],
+                  "suggested_correction": "",
+                  "retry_token": "",
+                  "execution_time": 412
+                },
+                "sam@harbor-fixture.example": {
+                  "status": "success",
+                  "result": "unknown",
+                  "flags": [
+                    "has_dns",
+                    "has_dns_mx"
+                  ],
+                  "suggested_correction": "",
+                  "retry_token": "",
+                  "execution_time": 412
+                },
+                "riley.brooks@harbor-fixture.example": {
+                  "status": "success",
+                  "result": "valid",
+                  "flags": [
+                    "has_dns",
+                    "has_dns_mx"
+                  ],
+                  "suggested_correction": "",
+                  "retry_token": "",
+                  "execution_time": 412
+                },
+                "taylor.ng@harbor-fixture.example": {
+                  "status": "success",
+                  "result": "disposable",
+                  "flags": [
+                    "has_dns",
+                    "has_dns_mx"
+                  ],
+                  "suggested_correction": "",
+                  "retry_token": "",
+                  "execution_time": 412
+                },
+                "morgan.diaz@contoso-fixture.example": {
+                  "status": "success",
+                  "result": "catchall",
+                  "flags": [
+                    "has_dns",
+                    "has_dns_mx"
+                  ],
+                  "suggested_correction": "",
+                  "retry_token": "",
+                  "execution_time": 412
+                }
+              },
+              "millionverifier": {
+                "lee.park@northwind-fixture.example": {
+                  "email": "fixture",
+                  "quality": "risky",
+                  "result": "catch_all",
+                  "resultcode": 2,
+                  "subresult": "unknown",
+                  "free": false,
+                  "role": false,
+                  "didyoumean": "",
+                  "credits": 4321,
+                  "executiontime": 2,
+                  "error": "",
+                  "livemode": true
+                },
+                "sam@harbor-fixture.example": {
+                  "email": "fixture",
+                  "quality": "bad",
+                  "result": "invalid",
+                  "resultcode": 6,
+                  "subresult": "mailbox_not_found",
+                  "free": false,
+                  "role": false,
+                  "didyoumean": "",
+                  "credits": 4321,
+                  "executiontime": 2,
+                  "error": "",
+                  "livemode": true
+                },
+                "morgan.diaz@contoso-fixture.example": {
+                  "__http": 200,
+                  "body": {
+                    "error": "Insufficient credits",
+                    "result": "",
+                    "credits": 0
+                  }
+                }
+              }
+            },
+            "dbRows": [
+              {
+                "email_hash": "37613f3067500438f182a8feaabb7a4fb0f5e526b8a89d46b5439470365ea940",
+                "final_status": null,
+                "sub_status": null,
+                "confidence": null,
+                "decided_by": null,
+                "verified_at": null,
+                "suppressed_reason": "hard_invalid"
+              },
+              {
+                "email_hash": "808fd7415198b8fafb2e76b06ca487eda6ddccbfc71293721a188e6a0e49f4a9",
+                "final_status": "valid",
+                "sub_status": null,
+                "confidence": 95,
+                "decided_by": "zerobounce",
+                "verified_at": "2026-11-11T10:00:00Z",
+                "suppressed_reason": null
+              }
+            ],
+            "queue": [
+              {
+                "id": 101,
+                "email": "casey.morgan@globex-fixture.example",
+                "list_id": "fx-list-import",
+                "external_ref": "row-1"
+              },
+              {
+                "id": 102,
+                "email": "riley.brooks@harbor-fixture.example",
+                "list_id": "fx-list-import",
+                "external_ref": "row-2"
+              },
+              {
+                "id": 103,
+                "email": "taylor.ng@harbor-fixture.example",
+                "list_id": "fx-list-import",
+                "external_ref": "row-3"
+              },
+              {
+                "id": 104,
+                "email": "morgan.diaz@contoso-fixture.example",
+                "list_id": "fx-list-import",
+                "external_ref": "row-4"
+              }
+            ]
+          }
+        }
+      }
+    ]
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": false,
+    "callerPolicy": "workflowsFromSameOwner",
+    "timezone": "UTC"
+  },
+  "tags": [],
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "author": "DH Robin, Revenue Infrastructure Architect · dhRobin Systems",
+    "license": "MIT"
+  }
+}
