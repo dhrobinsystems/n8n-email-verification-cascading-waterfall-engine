@@ -45,6 +45,8 @@ My answer:
 
 ## 2. Architecture
 
+![n8n Email Verification Cascading Waterfall Engine Workflow](workflow-overview.png)
+
 ```mermaid
 flowchart TD
     W[Verify Emails Webhook<br/>signed batch] --> V[Verify & Unwrap Request<br/>HMAC · size limit]
